@@ -1,2 +1,7 @@
 config.yaml
 *.bak
+*.bak2
+*.bak3
+*.db
+*.db-shm
+*.db-wal
