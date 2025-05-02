@@ -8,6 +8,7 @@ import json
 import openai
 from openai import AsyncOpenAI
 import re
+from collections import defaultdict # To store message mappings
 
 # --- Configuration ---
 CONFIG_FILE = 'config.yaml'
@@ -22,6 +23,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 class TranslationBot(discord.Client):
     """
     Translation bot class inheriting from discord.Client.
+    Includes message edit tracking.
     """
     def __init__(self, *, intents: discord.Intents, config_path: str):
         """
@@ -37,16 +39,20 @@ class TranslationBot(discord.Client):
         self.language_channel_map = {} # Structure: {language code (str): [channel ID (int), ...]}
         self.api_keys = {}             # Structure: {'discord_token': '...', 'openrouter_key': '...'}
         self.settings = {              # Default settings
-            'translation_model': 'google/gemini-flash', # Use a faster and cheaper model as default
-            'max_retries': 2, # Max retries for API requests
-            'retry_delay': 3  # Delay between retries in seconds
+            'translation_model': 'google/gemini-flash',
+            'max_retries': 2,
+            'retry_delay': 3
         }
         self.openai_client: AsyncOpenAI | None = None # OpenAI client
+        # --- Added: In-memory storage for message mappings ---
+        # Structure: {original_message_id: {target_lang_code: translated_message_id, ...}}
+        self.message_map = defaultdict(dict)
+        # Limit the size to prevent memory issues (optional)
+        self.message_map_max_size = 10000
 
     async def setup_hook(self) -> None:
         """
         Asynchronous setup hook called before the Bot starts.
-        Suitable for loading configurations, initializing resources, etc.
         """
         self.load_config()
         logger.info(f'Configuration loaded. Listening on {len(self.channel_language_map)} channels.')
@@ -66,7 +72,6 @@ class TranslationBot(discord.Client):
     async def close(self) -> None:
         """Clean up resources when the Bot is closing."""
         await super().close()
-        # OpenAI client usually doesn't require manual session closing
         logger.info("Bot is shutting down.")
 
     def load_config(self):
@@ -89,7 +94,6 @@ class TranslationBot(discord.Client):
                         for channel_id in channel_ids:
                             try:
                                 ch_id_int = int(channel_id)
-                                # Warn if a channel ID is configured for multiple languages
                                 if ch_id_int in self.channel_language_map: logger.warning(f"Channel ID {ch_id_int} is configured for both '{self.channel_language_map[ch_id_int]}' and '{lang_code}'. Using the latter ('{lang_code}').")
                                 self.channel_language_map[ch_id_int] = lang_code
                                 self.language_channel_map[lang_code].append(ch_id_int)
@@ -103,7 +107,6 @@ class TranslationBot(discord.Client):
                 else: logger.warning(f"Missing or invalid 'api_keys' section in configuration file '{self.config_path}'.")
                 # Load other settings
                 if 'settings' in config_data and isinstance(config_data['settings'], dict):
-                    # Update using get() to keep defaults if not specified in the config
                     self.settings['translation_model'] = config_data['settings'].get('translation_model', self.settings['translation_model'])
                     self.settings['max_retries'] = config_data['settings'].get('max_retries', self.settings['max_retries'])
                     self.settings['retry_delay'] = config_data['settings'].get('retry_delay', self.settings['retry_delay'])
@@ -134,7 +137,7 @@ class TranslationBot(discord.Client):
         logger.info('Bot is ready.')
 
     async def on_message(self, message: discord.Message):
-        """Handle message events."""
+        """Handle new message events."""
         # Ignore messages from self or other bots
         if message.author == self.user or message.author.bot: return
         # Ignore messages not from configured channels
@@ -148,11 +151,10 @@ class TranslationBot(discord.Client):
         # Get source language from configuration
         source_language = self.channel_language_map.get(source_channel_id)
         if not source_language:
-            # This should theoretically not happen due to the check above
             logger.warning(f"Internal error: Could not find language setting for channel ID {source_channel_id} in channel_language_map.")
             return
 
-        # Determine target languages and channels, excluding the source language
+        # Determine target languages and channels
         target_languages_map = {}
         target_language_codes = []
         for lang_code, channel_ids in self.language_channel_map.items():
@@ -160,43 +162,35 @@ class TranslationBot(discord.Client):
                 target_languages_map[lang_code] = channel_ids
                 target_language_codes.append(lang_code)
 
-        # If no other languages are configured, do nothing
         if not target_languages_map:
             logger.info(f"No target language channels configured for messages from channel {message.channel.name} ({source_language}).")
             return
 
-        # Get text to translate
         text_to_translate = message.content
-        # If no text but attachments exist, only sync attachments
+        # If only attachments, sync links without translation
         if not text_to_translate and message.attachments:
              logger.info(f"Message {message.id} contains only attachments. Syncing attachment links only.")
-             # Call distribution directly with an empty translations dictionary
              await self.distribute_translations(message, source_language, {}, target_languages_map)
              return
 
-        # Log received message details
         logger.info(f"Detected message from channel '{message.channel.name}' ({source_channel_id}, Language: {source_language}), Author: {message.author.display_name}")
-        log_content = text_to_translate[:100] + ('...' if len(text_to_translate) > 100 else '') # Limit log length
+        log_content = text_to_translate[:100] + ('...' if len(text_to_translate) > 100 else '')
         logger.info(f"Preparing to translate content to languages: {target_language_codes}")
         logger.debug(f"Content preview for translation: '{log_content}'")
 
         # --- Perform Translation ---
         try:
-            # Ensure OpenAI client is initialized
             if not self.openai_client:
-                logger.error("OpenAI client not initialized. Cannot perform translation. Please check API Key settings.")
+                logger.error("OpenAI client not initialized. Cannot perform translation.")
                 raise RuntimeError("OpenAI client not initialized")
 
-            # Call the translation function
             translations = await self.translate_text_with_openai(
                 text=text_to_translate,
                 source_lang=source_language,
                 target_langs=target_language_codes
             )
 
-            # Handle translation failure
             if translations is None:
-                # Detailed error already logged in translate_text_with_openai
                 await message.channel.send(f"Sorry {message.author.mention}, there was a problem during translation. Could not complete sync. Please check logs for details.", delete_after=15)
                 return
 
@@ -227,12 +221,80 @@ class TranslationBot(discord.Client):
             return
 
         # --- Distribute Translation Results ---
+        # The distribute_translations function will now return the mapping
         await self.distribute_translations(message, source_language, translations, target_languages_map)
+
+    # --- Added: Handle message edits ---
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """Handle message edit events."""
+        # Ignore edits from bots or if content hasn't changed
+        if after.author.bot or before.content == after.content:
+            return
+
+        # Ignore edits in channels not configured for translation
+        source_channel_id = after.channel.id
+        if source_channel_id not in self.channel_language_map:
+            return
+
+        # Ignore edits to messages we haven't tracked (not in message_map)
+        if after.id not in self.message_map:
+            logger.debug(f"Edited message {after.id} not found in tracking map. Ignoring edit.")
+            return
+
+        # Get original source language
+        source_language = self.channel_language_map.get(source_channel_id)
+        if not source_language: # Should not happen if message is in map
+             logger.warning(f"Internal error: Could not find language for tracked message {after.id} in channel {source_channel_id}.")
+             return
+
+        logger.info(f"Detected edit in tracked message {after.id} in channel '{after.channel.name}' ({source_language}).")
+
+        # Determine target languages based on existing map for this message
+        target_language_codes = list(self.message_map[after.id].keys())
+        if not target_language_codes:
+            logger.warning(f"No target languages found in map for edited message {after.id}. Cannot update translations.")
+            return
+
+        new_text_to_translate = after.content
+        log_content = new_text_to_translate[:100] + ('...' if len(new_text_to_translate) > 100 else '')
+        logger.info(f"Re-translating edited content to languages: {target_language_codes}")
+        logger.debug(f"Edited content preview: '{log_content}'")
+
+        # --- Perform Re-Translation ---
+        try:
+            if not self.openai_client:
+                logger.error("OpenAI client not initialized. Cannot perform re-translation.")
+                # Maybe send a notification?
+                return
+
+            new_translations = await self.translate_text_with_openai(
+                text=new_text_to_translate,
+                source_lang=source_language,
+                target_langs=target_language_codes
+            )
+
+            if new_translations is None:
+                logger.error(f"Failed to re-translate content for edited message {after.id}.")
+                # Optionally notify the user or admin
+                # await after.channel.send(f"Sorry {after.author.mention}, failed to update translations for your edited message.", delete_after=15)
+                return
+
+            logger.info(f"Successfully received updated translation results for message {after.id}.")
+            logger.debug(f"Updated translations: {new_translations}")
+
+        # Handle errors during re-translation (simplified for brevity, could reuse handlers from on_message)
+        except Exception as e:
+            logger.error(f"Unexpected error during re-translation process for message {after.id}: {e}", exc_info=True)
+            return
+
+        # --- Update Translated Messages ---
+        await self.update_translated_messages(after.id, new_translations)
 
 
     async def translate_text_with_openai(self, text: str, source_lang: str, target_langs: list[str]) -> dict | None:
         """
         Translates text into multiple target languages using the openai library (connected to OpenRouter).
+        (Logic remains the same as the previous version)
         """
         if not self.openai_client:
             logger.error("OpenAI client not initialized.")
@@ -253,98 +315,86 @@ Ensure the output is nothing but the JSON object. Do not include any explanation
 Target languages: {target_langs}"""
 
         user_prompt = text if text else ""
-        content_str = None # Initialize content_str
+        content_str = None
 
         try:
             logger.debug(f"Sending request to OpenRouter (via OpenAI lib)...")
             logger.debug(f"Model: {model_name}, Target Languages: {target_langs}")
 
-            # Call OpenAI compatible API endpoint
             response = await self.openai_client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                response_format={"type": "json_object"}, # Request JSON output
-                temperature=0.5, # Adjust temperature for more consistent output
-                max_tokens=1500 # Set max tokens as needed
+                response_format={"type": "json_object"},
+                temperature=0.5,
+                max_tokens=1500
             )
 
-            content_str = response.choices[0].message.content # Get response content
-            logger.debug(f"API response content (raw): {content_str[:500]}...") # Log first 500 chars
+            content_str = response.choices[0].message.content
+            logger.debug(f"API response content (raw): {content_str[:500]}...")
 
             if not content_str:
                  logger.error("API response successful, but content is empty.")
                  return None
 
-            # --- Added: Clean up Markdown code blocks ---
-            cleaned_content_str = content_str.strip() # Remove leading/trailing whitespace
+            # Clean up Markdown code blocks
+            cleaned_content_str = content_str.strip()
             if cleaned_content_str.startswith("```json"):
-                # Remove ```json prefix
                 cleaned_content_str = cleaned_content_str[len("```json"):].strip()
-            elif cleaned_content_str.startswith("```"): # Handle ``` without language specified
+            if cleaned_content_str.startswith("```"):
                 cleaned_content_str = cleaned_content_str[len("```"):].strip()
-
-            # Remove ``` suffix
             if cleaned_content_str.endswith("```"):
                 cleaned_content_str = cleaned_content_str[:-len("```")].strip()
-            # --- Cleaning finished ---
 
-            # Check if empty after cleaning
             if not cleaned_content_str:
                  logger.error("Content is empty after cleaning Markdown symbols.")
                  logger.debug(f"Original content_str: {content_str}")
                  return None
 
+            logger.debug(f"Cleaned content ready for parsing: {cleaned_content_str[:500]}...")
+            translations = json.loads(cleaned_content_str)
 
-            logger.debug(f"Cleaned content ready for parsing: {cleaned_content_str[:500]}...") # Log cleaned content
-            translations = json.loads(cleaned_content_str) # Parse using the cleaned string
-
-            # Validate if the result is a dictionary
             if not isinstance(translations, dict):
                 logger.error(f"Parsed content is not a valid JSON object: {translations}")
                 return None
 
-            # Validate if all target languages are present (optional but recommended)
+            # Validate missing languages
             missing_langs = [lang for lang in target_langs if lang not in translations]
             if missing_langs:
                 logger.warning(f"API response missing translations for some languages: {missing_langs}")
-                # Fill missing translations with a placeholder
                 for lang in missing_langs:
                     translations[lang] = f"[{lang.upper()} translation missing]"
 
-            # Filter out any keys not in target languages (if the model returned extra)
             filtered_translations = {k: v for k, v in translations.items() if k in target_langs}
             return filtered_translations
 
         except json.JSONDecodeError as e:
-            # Log error if JSON parsing fails
             logger.error(f"Failed to parse API response JSON: {e}")
-            # Ensure content_str was assigned before logging
             original_content_to_log = content_str if content_str is not None else "[Could not get raw response content]"
             logger.error(f"Raw response content: {original_content_to_log}")
             return None
         except (AttributeError, IndexError, TypeError) as e:
-             # Log error if response structure is unexpected
              logger.error(f"Error processing API response structure: {e}")
-             # Ensure response was assigned before logging
              response_to_log = response if 'response' in locals() else "[Could not get response object]"
              logger.debug(f"Full API response object: {response_to_log}")
              return None
-        # Catch other unexpected errors during translation
         except Exception as e:
             logger.error(f"Unexpected error during translation using OpenAI library: {e}", exc_info=True)
             return None
 
 
     async def distribute_translations(self, original_message: discord.Message, source_language: str, translations: dict, target_languages_map: dict):
-        """Distribute translation results to target channels."""
+        """
+        Distribute translation results to target channels and store message mappings.
+        """
         original_author = original_message.author
         original_channel = original_message.channel
         distribution_tasks = []
+        sent_message_ids = {} # Temp dict to store {lang_code: message_id} for this distribution
 
-        # Create a base embed with author, original link, and attachments
+        # Create a base embed
         base_embed = discord.Embed(color=discord.Color.blue())
         base_embed.set_author(name=f"{original_author.display_name} (from #{original_channel.name})", icon_url=original_author.display_avatar.url if original_author.display_avatar else None)
         base_embed.add_field(name="Original Message", value=f"[Click here to view]({original_message.jump_url})", inline=False)
@@ -355,51 +405,171 @@ Target languages: {target_langs}"""
 
         # Inner function to send a single translation embed
         async def _send_translation(target_channel_id, lang_code, translated_text):
+            # --- Added: Store sent message ID ---
+            sent_msg = None
             try:
                 target_channel = self.get_channel(target_channel_id)
                 if target_channel and isinstance(target_channel, discord.TextChannel):
-                    # Copy the base embed and add translation details
                     embed_to_send = base_embed.copy()
                     embed_to_send.description = translated_text if translated_text and translated_text.strip() else "*(No text content or translation result is empty)*"
                     embed_to_send.set_footer(text=f"Original ({source_language.upper()}) → Target ({lang_code.upper()})")
-                    # Send the embed
-                    await target_channel.send(embed=embed_to_send)
-                    logger.info(f"Sent translation ({lang_code}) to channel '{target_channel.name}' ({target_channel_id})")
-                else: logger.warning(f"Could not find target channel ID {target_channel_id} or it's not a valid text channel.")
+                    # Send and get the message object
+                    sent_msg = await target_channel.send(embed=embed_to_send)
+                    logger.info(f"Sent translation ({lang_code}) to channel '{target_channel.name}' ({target_channel_id}) - Msg ID: {sent_msg.id}")
+                    # Return the ID for mapping
+                    return sent_msg.id
+                else:
+                    logger.warning(f"Could not find target channel ID {target_channel_id} or it's not a valid text channel.")
+                    return None # Indicate failure
             except discord.errors.Forbidden: logger.error(f"Permission denied: Cannot send message to channel ID {target_channel_id} ({target_channel.name if target_channel else 'Unknown Channel'}).")
             except discord.errors.HTTPException as e: logger.error(f"HTTP error sending message to channel ID {target_channel_id} (Status: {e.status}): {e.text}")
             except Exception as e: logger.error(f"Unexpected error distributing translation to channel ID {target_channel_id}: {e}", exc_info=True)
+            return None # Indicate failure
 
-        # Create send tasks based on translations or attachments
-        if translations: # If there are text translations
+        # Create send tasks
+        if translations:
             for lang_code, translated_text in translations.items():
                 if lang_code in target_languages_map:
-                    for target_channel_id in target_languages_map[lang_code]:
-                        distribution_tasks.append(_send_translation(target_channel_id, lang_code, translated_text))
+                    # Send to the first channel configured for this language
+                    # (Modify if you need to send to multiple channels per language)
+                    target_channel_id = target_languages_map[lang_code][0]
+                    distribution_tasks.append(_send_translation(target_channel_id, lang_code, translated_text))
                 else: logger.warning(f"Translation result included language code '{lang_code}' which is not in target_languages_map. Skipping.")
-        elif not translations and original_message.attachments: # If only attachments need syncing
+        elif not translations and original_message.attachments:
              logger.info(f"Syncing attachment links only to all target channels...")
              for lang_code, target_channel_ids in target_languages_map.items():
-                 for target_channel_id in target_channel_ids:
-                     # Send the base embed with an empty description
-                     distribution_tasks.append(_send_translation(target_channel_id, lang_code, ""))
-        else: # No translations and no attachments
+                 # Send to the first channel configured for this language
+                 target_channel_id = target_channel_ids[0]
+                 distribution_tasks.append(_send_translation(target_channel_id, lang_code, ""))
+        else:
              logger.warning("No translation results and no attachments to distribute.")
 
-        # Run all distribution tasks concurrently
+        # Run tasks and collect results (sent message IDs)
         if distribution_tasks:
-            await asyncio.gather(*distribution_tasks)
+            results = await asyncio.gather(*distribution_tasks)
+            # --- Added: Store the mapping ---
+            successful_sends = {}
+            lang_codes_in_order = list(translations.keys()) if translations else list(target_languages_map.keys()) # Get lang codes in order tasks were created
+
+            for i, sent_id in enumerate(results):
+                if sent_id: # Check if sending was successful (got an ID)
+                    lang_code = lang_codes_in_order[i]
+                    successful_sends[lang_code] = sent_id
+
+            if successful_sends:
+                 # Add/Update the map entry for the original message
+                 self.message_map[original_message.id] = successful_sends
+                 logger.info(f"Stored mapping for original message {original_message.id}: {successful_sends}")
+                 # Optional: Prune old entries if map gets too large
+                 if len(self.message_map) > self.message_map_max_size:
+                     # Simple FIFO eviction
+                     oldest_key = next(iter(self.message_map))
+                     del self.message_map[oldest_key]
+                     logger.info(f"Message map size exceeded {self.message_map_max_size}. Removed oldest entry: {oldest_key}")
+
             logger.info(f"Finished distributing all translations/attachments for original message {original_message.id}.")
+
+    # --- Added: Function to update translated messages ---
+    async def update_translated_messages(self, original_message_id: int, new_translations: dict):
+        """
+        Finds and edits translated messages based on the stored mapping.
+        """
+        if original_message_id not in self.message_map:
+            logger.warning(f"Cannot update translations for {original_message_id}: No mapping found.")
+            return
+
+        translation_map = self.message_map[original_message_id]
+        update_tasks = []
+
+        async def _edit_translation(lang_code, translated_message_id, new_text):
+            target_channel_id = None
+            # Find the channel ID associated with this language and original message
+            # This assumes the channel mapping hasn't changed drastically.
+            # A more robust approach might store channel_id alongside message_id in the map.
+            for cid_list in self.language_channel_map.get(lang_code, []):
+                 # We need the specific channel where the message was sent.
+                 # Fetching the message will give us the channel.
+                 pass # We'll fetch the message below
+
+            try:
+                # Fetch the translated message object using its ID
+                # This requires iterating through potential channels or storing channel ID in map
+                # Let's try fetching from the first configured channel for that language
+                target_channel_ids = self.language_channel_map.get(lang_code)
+                if not target_channel_ids:
+                    logger.warning(f"No channel configured for language {lang_code}, cannot fetch message {translated_message_id}")
+                    return
+
+                translated_message = None
+                target_channel = None
+                # Try fetching from the channels associated with the language
+                for cid in target_channel_ids:
+                    channel = self.get_channel(cid)
+                    if channel:
+                        try:
+                            # fetch_message might raise NotFound or Forbidden
+                            msg = await channel.fetch_message(translated_message_id)
+                            if msg:
+                                translated_message = msg
+                                target_channel = channel
+                                break # Found the message
+                        except discord.NotFound:
+                            continue # Try next channel
+                        except discord.Forbidden:
+                            logger.error(f"Permission error fetching message {translated_message_id} in channel {cid}")
+                            continue # Try next channel
+                if not translated_message:
+                    logger.warning(f"Could not find translated message {translated_message_id} for lang {lang_code} in configured channels.")
+                    # Remove this entry from the map as the message is likely deleted
+                    if lang_code in self.message_map[original_message_id]:
+                        del self.message_map[original_message_id][lang_code]
+                    return
+
+                # Check if the message has an embed to edit
+                if translated_message.embeds:
+                    original_embed = translated_message.embeds[0]
+                    # Create a new embed based on the old one, only changing the description
+                    new_embed = original_embed.copy()
+                    new_embed.description = new_text if new_text and new_text.strip() else "*(No text content or translation result is empty)*"
+                    # Edit the message with the new embed
+                    await translated_message.edit(embed=new_embed)
+                    logger.info(f"Successfully edited translated message {translated_message_id} in channel '{target_channel.name}' for language {lang_code}.")
+                else:
+                    logger.warning(f"Translated message {translated_message_id} has no embed to edit.")
+
+            except discord.NotFound:
+                logger.warning(f"Translated message {translated_message_id} not found (likely deleted). Removing from map.")
+                if lang_code in self.message_map[original_message_id]:
+                     del self.message_map[original_message_id][lang_code]
+            except discord.Forbidden:
+                logger.error(f"Permission error editing message {translated_message_id}. Bot might lack 'Manage Messages' permission or is trying to edit another user's message (shouldn't happen here).")
+            except Exception as e:
+                logger.error(f"Unexpected error editing translated message {translated_message_id}: {e}", exc_info=True)
+
+        # Create tasks to edit each translated message
+        for lang_code, translated_message_id in translation_map.items():
+            if lang_code in new_translations:
+                update_tasks.append(
+                    _edit_translation(lang_code, translated_message_id, new_translations[lang_code])
+                )
+            else:
+                 logger.warning(f"New translation missing for language {lang_code} during update for original message {original_message_id}.")
+
+
+        # Run update tasks concurrently
+        if update_tasks:
+            await asyncio.gather(*update_tasks)
+            logger.info(f"Finished updating translations for original message {original_message_id}.")
+
 
 # --- Main Entry Point ---
 if __name__ == "__main__":
     # --- Read config temporarily to check keys before full bot init ---
     temp_config = {}
     try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f: temp_config = yaml.safe_load(f) or {} # Ensure dict even if empty
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f: temp_config = yaml.safe_load(f) or {}
     except FileNotFoundError:
         logger.critical(f"Error: Configuration file {CONFIG_FILE} not found. Please create it first.")
-        # Attempt to create example, but exit anyway as token is missing
         TranslationBot(intents=discord.Intents.default(), config_path=CONFIG_FILE).create_example_config()
         exit(1)
     except yaml.YAMLError as e:
@@ -413,40 +583,30 @@ if __name__ == "__main__":
     openrouter_key = api_keys.get('openrouter_key')
     config_valid = True
     if not discord_token or discord_token == 'YOUR_DISCORD_BOT_TOKEN':
-        logger.critical("Error: Valid Discord Bot Token not configured. Please set environment variable or configure in config.yaml."); config_valid = False
+        logger.critical("Error: Valid Discord Bot Token not configured."); config_valid = False
     if not openrouter_key or openrouter_key == 'YOUR_OPENROUTER_API_KEY':
-        logger.critical("Error: Valid OpenRouter API Key not configured. Please configure in config.yaml."); config_valid = False
+        logger.critical("Error: Valid OpenRouter API Key not configured."); config_valid = False
     if not channels_config:
         logger.critical("Error: No channels configured in config.yaml."); config_valid = False
-    if not config_valid: exit(1) # Exit if config is invalid
+    if not config_valid: exit(1)
 
     # --- Set up required Bot Intents ---
-    # Intents must be configured before initializing the Client
     intents = discord.Intents.default()
-    intents.message_content = True # Required to read message content
-    intents.guilds = True          # Required for guild-related events/info
-    intents.messages = True        # Required for message events (on_message)
+    intents.message_content = True
+    intents.guilds = True
+    intents.messages = True
 
     logger.info("Configuring Intents...")
     if not intents.message_content:
-         # This warning is important for discord.py v2+
-         logger.warning("Warning: Message Content Intent is not enabled. Bot might not be able to read message content. Please enable it in the Discord Developer Portal.")
+         logger.warning("Warning: Message Content Intent is not enabled.")
 
     # --- Initialize Bot instance with Intents ---
-    # Intents are now passed during initialization
     bot = TranslationBot(intents=intents, config_path=CONFIG_FILE)
 
     logger.info("Starting Bot...")
     try:
-        # Run the Bot using the token
-        # The bot instance will call load_config internally via setup_hook
-        bot.run(discord_token, log_handler=None) # Use None to disable discord.py's default logging handler if we configured our own
-    except discord.LoginFailure:
-        logger.critical("Login Failed: Invalid Discord Token.")
-    except discord.PrivilegedIntentsRequired:
-         logger.critical("Login Failed: Missing necessary Privileged Intents (e.g., Message Content). Please enable them in the Discord Developer Portal.")
-    except Exception as e:
-        logger.critical(f"Critical error during Bot startup: {e}", exc_info=True)
-    finally:
-        # The bot.run() method handles cleanup, including calling bot.close()
-        pass
+        bot.run(discord_token, log_handler=None)
+    except discord.LoginFailure: logger.critical("Login Failed: Invalid Discord Token.")
+    except discord.PrivilegedIntentsRequired: logger.critical("Login Failed: Missing necessary Privileged Intents.")
+    except Exception as e: logger.critical(f"Critical error during Bot startup: {e}", exc_info=True)
+    finally: pass
