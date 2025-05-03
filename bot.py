@@ -26,10 +26,9 @@ class TranslationBot(discord.Client):
     """
     Translation bot class inheriting from discord.Client.
     Includes message edit tracking (using SQLite via on_raw_message_edit)
-    and channel type support.
+    and channel type support. Features improved message format.
     """
     def __init__(self, *, intents: discord.Intents, config_path: str):
-        # Ensure necessary intents are enabled, especially messages for content access
         if not intents.messages:
              logger.warning("discord.Intents.messages is not enabled. Bot might miss message events.")
         if not intents.message_content:
@@ -42,7 +41,7 @@ class TranslationBot(discord.Client):
         self.language_channel_map = defaultdict(list)
         self.api_keys = {}
         self.settings = {
-            'translation_model': 'google/gemma-3-27b-it',
+            'translation_model': 'google/gemini-flash',
             'max_retries': 2,
             'retry_delay': 3
         }
@@ -143,15 +142,9 @@ class TranslationBot(discord.Client):
                                     self.channel_type_map[ch_id_int] = channel_type
                                     self.language_channel_map[lang_code].append(ch_id_int)
                                     total_channels_loaded += 1
-                                    # Keep this debug log if useful
-                                    # logger.debug(f"  Loaded Channel ID: {ch_id_int}, Lang: {lang_code}, Type: {channel_type}")
                                 except ValueError:
                                     logger.warning(f"Invalid channel ID '{channel_id}' found under language '{lang_code}' (type: {channel_type}). Skipping.")
                     logger.info(f"Successfully loaded {total_channels_loaded} channel configurations across all types.")
-                    # Keep these debug logs if useful
-                    # logger.debug(f"Final channel_language_map: {self.channel_language_map}")
-                    # logger.debug(f"Final channel_type_map: {self.channel_type_map}")
-                    # logger.debug(f"Final language_channel_map: {dict(self.language_channel_map)}")
                 else:
                     logger.warning(f"Missing or invalid 'channels' section in configuration file '{self.config_path}'. No channels loaded.")
 
@@ -197,7 +190,7 @@ class TranslationBot(discord.Client):
                 }
             },
             'settings': {
-                'translation_model': 'google/gemma-3-27b-it',
+                'translation_model': 'google/gemini-flash',
                 'max_retries': 2,
                 'retry_delay': 3
             }
@@ -255,8 +248,6 @@ class TranslationBot(discord.Client):
         logger.info(f"Detected message from channel '{message.channel.name}' ({source_channel_id}, Type: {source_channel_type}, Lang: {source_language}), Author: {message.author.display_name}")
         log_content = text_to_translate[:100] + ('...' if len(text_to_translate) > 100 else '')
         logger.info(f"Preparing to translate content to languages (for writable channels): {target_language_codes}")
-        # Keep this debug log if useful
-        # logger.debug(f"Content preview for translation: '{log_content}'")
 
         # --- Perform Translation ---
         try:
@@ -272,8 +263,6 @@ class TranslationBot(discord.Client):
                 await message.channel.send(f"Sorry {message.author.mention}, translation failed. Check logs.", delete_after=15)
                 return
             logger.info(f"Successfully received translation results from API.")
-            # Keep this debug log if useful
-            # logger.debug(f"Translation results: {translations}")
         # --- Error handling ---
         except openai.AuthenticationError:
             logger.error("OpenAI API Auth Failed.")
@@ -301,21 +290,15 @@ class TranslationBot(discord.Client):
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         """Handle message edit events if message is cached (Fallback)."""
-        # This handler is less reliable after restarts due to cache.
-        # on_raw_message_edit is the primary handler.
         logger.debug(f"on_message_edit triggered for message ID {after.id} (might be ignored).")
-        # Basic checks to prevent processing if handled by raw handler or irrelevant
         if after.author.bot: return
         source_channel_id = after.channel.id
         source_channel_type = self.channel_type_map.get(source_channel_id)
         if source_channel_type == 'write_only' or source_channel_id not in self.channel_language_map: return
-        # Content check (only if 'before' is available)
         if before and before.content is not None and before.content == after.content:
              logger.debug(f"[on_message_edit] Content of message {after.id} did not change. Skipping.")
              return
-        # Avoid double processing if raw handler likely succeeded (e.g., check a flag if needed)
         logger.info(f"[on_message_edit] Processing edit for message {after.id} (potentially redundant, check raw handler logs).")
-        # Consider removing or simplifying this handler if on_raw_message_edit proves sufficient.
 
 
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
@@ -329,79 +312,54 @@ class TranslationBot(discord.Client):
         # Check Channel Configuration
         source_channel_id = payload.channel_id
         source_channel_type = self.channel_type_map.get(source_channel_id)
-        if source_channel_type == 'write_only':
-            # logger.debug(f"Raw edit ignored: Channel {source_channel_id} is write_only.") # Can be noisy
-            return
-        if source_channel_id not in self.channel_language_map:
-             # logger.debug(f"Raw edit ignored: Channel {source_channel_id} is not configured.") # Can be noisy
-             return
+        if source_channel_type == 'write_only': return
+        if source_channel_id not in self.channel_language_map: return
 
         # Extract Edited Content
         new_content = payload.data.get('content', None)
-        if new_content is None:
-            # logger.debug(f"Raw edit ignored: No 'content' field for message {payload.message_id}.") # Can be noisy
-            return
+        if new_content is None: return # Only handle content edits
 
         # Check if Author is Bot
         author_data = payload.data.get('author', {})
-        if author_data.get('bot', False):
-            # logger.debug(f"Raw edit ignored: Author {author_data.get('id')} is a bot.") # Can be noisy
-            return
+        if author_data.get('bot', False): return
 
         # --- Check Database for Tracking ---
-        # logger.debug(f"Checking database for message ID: {payload.message_id}...") # Keep if needed
-        if not self.db:
-            logger.error("Database not available in on_raw_message_edit.")
-            return
+        if not self.db: logger.error("Database not available in on_raw_message_edit."); return
 
         tracked_translations = []
         try:
             query = "SELECT target_language, translated_message_id, target_channel_id FROM message_map WHERE original_message_id = ?"
             params = (payload.message_id,)
-            # logger.debug(f"Executing DB query: {query} with params: {params}") # Keep if needed
             async with self.db.execute(query, params) as cursor:
                 tracked_translations = await cursor.fetchall()
-            # logger.debug(f"DB query result for original_message_id {payload.message_id}: {tracked_translations}") # Keep if needed
         except Exception as e:
             logger.error(f"Error querying database for message map of {payload.message_id}: {e}", exc_info=True)
             return
 
-        if not tracked_translations:
-            # logger.debug(f"Edited message {payload.message_id} not found in database tracking map. Ignoring raw edit.") # Can be noisy
-            return
+        if not tracked_translations: return # Not tracking this message
         # --- End Database Check ---
 
         # --- Proceed with Re-translation and Update ---
         source_language = self.channel_language_map.get(source_channel_id)
-        if not source_language:
-            logger.warning(f"Internal error: Could not find language for tracked message {payload.message_id}.")
-            return
+        if not source_language: logger.warning(f"Internal error: Could not find language for tracked message {payload.message_id}."); return
 
         logger.info(f"Detected edit via raw event in tracked message {payload.message_id} in channel {source_channel_id} ({source_language}).")
 
         target_language_codes = [row[0] for row in tracked_translations]
-        if not target_language_codes:
-            logger.warning(f"No target languages found in DB map for edited message {payload.message_id}.")
-            return
+        if not target_language_codes: logger.warning(f"No target languages found in DB map for edited message {payload.message_id}."); return
 
         log_content = new_content[:100] + ('...' if len(new_content) > 100 else '')
         logger.info(f"Re-translating edited content to languages: {target_language_codes}")
-        # logger.debug(f"Edited content preview: '{log_content}'") # Keep if needed
 
         try:
-            if not self.openai_client:
-                logger.error("OpenAI client not initialized.")
-                return
+            if not self.openai_client: logger.error("OpenAI client not initialized."); return
             new_translations = await self.translate_text_with_openai(
-                text=new_content, # Use content from payload
+                text=new_content,
                 source_lang=source_language,
                 target_langs=target_language_codes
             )
-            if new_translations is None:
-                logger.error(f"Failed to re-translate content for edited message {payload.message_id}.")
-                return
+            if new_translations is None: logger.error(f"Failed to re-translate content for edited message {payload.message_id}."); return
             logger.info(f"Successfully received updated translation results for message {payload.message_id}.")
-            # logger.debug(f"Updated translations: {new_translations}") # Keep if needed
         except Exception as e:
             logger.error(f"Unexpected error during re-translation for message {payload.message_id}: {e}", exc_info=True)
             return
@@ -413,8 +371,8 @@ class TranslationBot(discord.Client):
     async def translate_text_with_openai(self, text: str, source_lang: str, target_langs: list[str]) -> dict | None:
         """Translates text using OpenAI library."""
         if not self.openai_client: logger.error("OpenAI client not initialized."); return None
-        model_name = self.settings.get('translation_model', 'google/gemma-3-27b-it')
-        system_prompt = f"""You are an expert multilingual translator, you will correctly handle the meaning and context of clearly defined idioms, and you will not add any content that is not present in the original text. Translate the user's text from {source_lang} into the following languages: {', '.join(target_langs)}.
+        model_name = self.settings.get('translation_model', 'google/gemini-flash')
+        system_prompt = f"""You are an expert multilingual translator. Translate the user's text from {source_lang} into the following languages: {', '.join(target_langs)}.
 Respond ONLY with a valid JSON object containing the translations. The JSON object should have language codes (exactly as provided: {', '.join(target_langs)}) as keys and the corresponding translated text as string values.
 Example format for targets {target_langs}: {{ "{target_langs[0]}": "translation for {target_langs[0]}", "{target_langs[1]}": "translation for {target_langs[1]}" }}
 Ensure the output is nothing but the JSON object. Do not include any explanations, markdown formatting around the JSON, or introductory text. Preserve original formatting like markdown (e.g., bold, italics) within the translated strings where appropriate, but prioritize accurate translation. If the input text is empty or contains only whitespace, return an empty JSON object {{}}.
@@ -422,13 +380,10 @@ Target languages: {target_langs}"""
         user_prompt = text if text else ""
         content_str = None
         try:
-            # logger.debug(f"Sending request to OpenRouter (via OpenAI lib)...") # Can be noisy
-            # logger.debug(f"Model: {model_name}, Target Languages: {target_langs}") # Can be noisy
             response = await self.openai_client.chat.completions.create(
                 model=model_name, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 response_format={"type": "json_object"}, temperature=0.5, max_tokens=1500 )
             content_str = response.choices[0].message.content
-            # logger.debug(f"API response content (raw): {content_str[:500]}...") # Keep if needed
             if not content_str: logger.error("API response successful, but content is empty."); return None
             # Clean Markdown
             cleaned_content_str = content_str.strip()
@@ -436,7 +391,6 @@ Target languages: {target_langs}"""
             if cleaned_content_str.startswith("```"): cleaned_content_str = cleaned_content_str[len("```"):].strip()
             if cleaned_content_str.endswith("```"): cleaned_content_str = cleaned_content_str[:-len("```")].strip()
             if not cleaned_content_str: logger.error("Content is empty after cleaning Markdown symbols."); logger.debug(f"Original content_str: {content_str}"); return None
-            # logger.debug(f"Cleaned content ready for parsing: {cleaned_content_str[:500]}...") # Keep if needed
             translations = json.loads(cleaned_content_str)
             if not isinstance(translations, dict): logger.error(f"Parsed content is not a valid JSON object: {translations}"); return None
             # Fill missing
@@ -455,7 +409,7 @@ Target languages: {target_langs}"""
         except (AttributeError, IndexError, TypeError) as e:
              logger.error(f"Error processing API response structure: {e}")
              response_to_log = response if 'response' in locals() else "[Could not get response object]"
-             logger.debug(f"Full API response object: {response_to_log}") # Keep this debug log
+             logger.debug(f"Full API response object: {response_to_log}")
              return None
         except Exception as e:
             logger.error(f"Unexpected error during translation using OpenAI library: {e}", exc_info=True)
@@ -464,31 +418,56 @@ Target languages: {target_langs}"""
 
     async def distribute_translations(self, original_message: discord.Message, source_language: str, translations: dict, writable_target_map: dict):
         """
-        Distribute translations and store mappings in the database.
+        Distribute translations and store mappings in the database using the new format.
         """
         original_author = original_message.author
         original_channel = original_message.channel
         distribution_tasks = []
         lang_codes_in_order = list(translations.keys()) if translations else list(writable_target_map.keys())
 
-        # Create base embed
-        base_embed = discord.Embed(color=discord.Color.blue())
-        base_embed.set_author(name=f"{original_author.display_name} (from #{original_channel.name})", icon_url=original_author.display_avatar.url if original_author.display_avatar else None)
-        base_embed.add_field(name="Original Message", value=f"[Click here to view]({original_message.jump_url})", inline=False)
-        if original_message.attachments:
-            attachment_links = [f"[{att.filename}]({att.url})" for i, att in enumerate(original_message.attachments) if i < 5]
-            if len(original_message.attachments) > 5: attachment_links.append("...")
-            if attachment_links: base_embed.add_field(name=f"Attachments ({len(original_message.attachments)})", value="\n".join(attachment_links), inline=False)
-
+        # --- Modified: Inner function uses new format ---
         async def _send_translation(target_channel_id, lang_code, translated_text):
             sent_msg_id = None
             try:
                 target_channel = self.get_channel(target_channel_id)
                 channel_type = self.channel_type_map.get(target_channel_id)
                 if target_channel and isinstance(target_channel, discord.TextChannel) and channel_type in ['standard', 'write_only']:
-                    embed_to_send = base_embed.copy()
-                    embed_to_send.description = translated_text if translated_text and translated_text.strip() else "*(No text content or translation result is empty)*"
-                    embed_to_send.set_footer(text=f"Original ({source_language.upper()}) → Target ({lang_code.upper()})")
+                    # Create embed with translated text
+                    embed_to_send = discord.Embed(
+                        description=translated_text if translated_text and translated_text.strip() else "*(No text content)*",
+                        color=discord.Color.blue()
+                    )
+                    # Set author field
+                    embed_to_send.set_author(
+                        name=f"{original_author.display_name} (from #{original_channel.name})",
+                        icon_url=original_author.display_avatar.url if original_author.display_avatar else None
+                    )
+                    # Add single compact hyperlink with source language
+                    embed_to_send.add_field(
+                        name="", # Keep name empty for cleaner look
+                        value=f"[Original Message ({source_language.upper()})]({original_message.jump_url})",
+                        inline=False
+                    )
+
+                    # Handle image attachment directly in embed if present
+                    if original_message.attachments:
+                        first_att = original_message.attachments[0]
+                        filename_lower = first_att.filename.lower()
+                        # Check for common image extensions
+                        if any(filename_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+                            embed_to_send.set_image(url=first_att.proxy_url) # Use proxy_url
+
+                        # If multiple attachments, add compact reference link
+                        if len(original_message.attachments) > 1:
+                            att_count = len(original_message.attachments)
+                            # Add a field linking back to the original message for other attachments
+                            embed_to_send.add_field(
+                                name="", # Keep name empty
+                                value=f"[+{att_count-1} more attachment{'s' if att_count > 2 else ''}]({original_message.jump_url})",
+                                inline=False
+                            )
+                    # --- End Format Changes ---
+
                     sent_msg = await target_channel.send(embed=embed_to_send)
                     sent_msg_id = sent_msg.id
                     logger.info(f"Sent translation ({lang_code}) to {channel_type} channel '{target_channel.name}' ({target_channel_id}) - Msg ID: {sent_msg_id}")
@@ -498,8 +477,9 @@ Target languages: {target_langs}"""
             except discord.errors.HTTPException as e: logger.error(f"HTTP error sending message to channel ID {target_channel_id} (Status: {e.status}): {e.text}")
             except Exception as e: logger.error(f"Unexpected error distributing translation to channel ID {target_channel_id}: {e}", exc_info=True)
             return {'msg_id': sent_msg_id, 'channel_id': target_channel_id} if sent_msg_id else None
+        # --- End Modified Inner Function ---
 
-        # Create send tasks
+        # Create send tasks (logic unchanged)
         if translations:
             for lang_code, translated_text in translations.items():
                 if lang_code in writable_target_map:
@@ -515,10 +495,8 @@ Target languages: {target_langs}"""
         # Run tasks and collect results
         if distribution_tasks:
             results = await asyncio.gather(*distribution_tasks)
-            # Store mapping in Database
-            if not self.db:
-                logger.error("Database not available, cannot store message map.")
-                return
+            # Store mapping in Database (logic unchanged)
+            if not self.db: logger.error("Database not available, cannot store message map."); return
 
             insert_data_list = []
             for i, result_detail in enumerate(results):
@@ -526,13 +504,7 @@ Target languages: {target_langs}"""
                     lang_code = lang_codes_in_order[i]
                     translated_msg_id = result_detail['msg_id']
                     target_channel_id = result_detail['channel_id']
-                    insert_data_list.append((
-                        original_message.id,
-                        lang_code,
-                        translated_msg_id,
-                        target_channel_id
-                    ))
-                    # logger.debug(f"Prepared DB insert for original {original_message.id}, lang {lang_code}, translated {translated_msg_id}") # Can be noisy
+                    insert_data_list.append((original_message.id, lang_code, translated_msg_id, target_channel_id))
 
             if insert_data_list:
                 try:
@@ -552,7 +524,7 @@ Target languages: {target_langs}"""
 
     async def update_translated_messages(self, original_message_id: int, new_translations: dict, tracked_translations: list):
         """
-        Finds and edits translated messages based on data fetched from the database.
+        Finds and edits translated messages, preserving the new format.
         """
         update_tasks = []
 
@@ -573,8 +545,12 @@ Target languages: {target_langs}"""
 
                 if translated_message.embeds:
                     original_embed = translated_message.embeds[0]
+                    # --- Modified: Only update description ---
+                    # Create a new embed by copying, ensuring other fields (author, image, links) are preserved
                     new_embed = original_embed.copy()
+                    # Update only the description with the new translation
                     new_embed.description = new_text if new_text and new_text.strip() else "*(No text content or translation result is empty)*"
+                    # --- End Modification ---
                     await translated_message.edit(embed=new_embed)
                     logger.info(f"Successfully edited translated message {translated_message_id} in channel '{target_channel.name}' for language {lang_code}.")
                 else:
