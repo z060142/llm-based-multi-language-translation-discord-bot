@@ -6,4 +6,9 @@ config.yaml
 *.db-shm
 *.db-wal
 *.yaml
+venv/
 claudecode.md
+start-bot.bat
+start-ui.bat
+start-bot.sh
+start-ui.sh
