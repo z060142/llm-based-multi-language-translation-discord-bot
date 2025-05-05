@@ -43,7 +43,8 @@ class TranslationBot(discord.Client):
         self.api_keys = {} # Still used for discord_token
         self.settings = { # General settings, model moved to service config
             'max_retries': 2,
-            'retry_delay': 3
+            'retry_delay': 3,
+            'language_separation_threshold': 1200 # Default value, will be overwritten by config
         }
         # New attributes for translation services
         self.translation_services = {}  # Stores service configurations from config.yaml
@@ -198,10 +199,11 @@ class TranslationBot(discord.Client):
                 # Load other settings
                 if 'settings' in config_data and isinstance(config_data['settings'], dict):
                     # self.settings['translation_model'] = config_data['settings'].get('translation_model', self.settings['translation_model']) # Removed as model is per-service
-                    self.settings['max_retries'] = config_data['settings'].get('max_retries', self.settings['max_retries'])
-                    self.settings['retry_delay'] = config_data['settings'].get('retry_delay', self.settings['retry_delay'])
-                    logger.info("Successfully loaded general settings.")
-                else: logger.info("No 'settings' section found, using default settings.")
+                    self.settings['max_retries'] = int(config_data['settings'].get('max_retries', self.settings['max_retries']))
+                    self.settings['retry_delay'] = int(config_data['settings'].get('retry_delay', self.settings['retry_delay']))
+                    self.settings['language_separation_threshold'] = int(config_data['settings'].get('language_separation_threshold', self.settings['language_separation_threshold']))
+                    logger.info(f"Successfully loaded general settings (Threshold: {self.settings['language_separation_threshold']}).")
+                else: logger.info(f"No 'settings' section found, using default settings (Threshold: {self.settings['language_separation_threshold']}).")
 
                 # Load translation services configuration
                 if 'translation_services' in config_data and isinstance(config_data['translation_services'], dict):
@@ -544,9 +546,9 @@ class TranslationBot(discord.Client):
                 target_channel = self.get_channel(target_channel_id)
                 channel_type = self.channel_type_map.get(target_channel_id)
                 if target_channel and isinstance(target_channel, discord.TextChannel) and channel_type in ['standard', 'write_only']:
-                    # Create embed with translated text
+                    # Create embed with translated text (or None if no text)
                     embed_to_send = discord.Embed(
-                        description=translated_text if translated_text and translated_text.strip() else "*(No text content)*",
+                        description=translated_text if translated_text and translated_text.strip() else None,
                         color=discord.Color.blue()
                     )
                     # Set author field
@@ -633,6 +635,32 @@ class TranslationBot(discord.Client):
 
             logger.info(f"Finished distributing messages for original message {original_message.id}.")
 
+    def calculate_effective_length(self, text: str) -> int:
+        """
+        Calculates the 'effective' length of the text, giving higher weight to CJK characters.
+        This helps estimate potential token usage more accurately for separation logic.
+        """
+        effective_length = 0
+        for char in text:
+            # Check if character is CJK (Unicode ranges)
+            # CJK Unified Ideographs: U+4E00 to U+9FFF
+            # Hangul Syllables: U+AC00 to U+D7AF
+            # Hiragana: U+3040 to U+309F
+            # Katakana: U+30A0 to U+30FF
+            # CJK Symbols and Punctuation: U+3000 to U+303F
+            # Halfwidth and Fullwidth Forms: U+FF00 to U+FFEF (includes fullwidth Latin chars)
+            if (
+                '\u4e00' <= char <= '\u9fff' or
+                '\uac00' <= char <= '\ud7af' or
+                '\u3040' <= char <= '\u309f' or
+                '\u30a0' <= char <= '\u30ff' or
+                '\u3000' <= char <= '\u303f' or
+                '\uff00' <= char <= '\uffef'
+            ):
+                effective_length += 2 # Assign double weight
+            else:
+                effective_length += 1 # Assign single weight
+        return effective_length
 
     async def update_translated_messages(self, original_message_id: int, new_translations: dict, tracked_translations: list):
         """
@@ -660,8 +688,8 @@ class TranslationBot(discord.Client):
                     # --- Modified: Only update description ---
                     # Create a new embed by copying, ensuring other fields (author, image, links) are preserved
                     new_embed = original_embed.copy()
-                    # Update only the description with the new translation
-                    new_embed.description = new_text if new_text and new_text.strip() else "*(No text content or translation result is empty)*"
+                    # Update only the description with the new translation (or None if no text)
+                    new_embed.description = new_text if new_text and new_text.strip() else None
                     # --- End Modification ---
                     await translated_message.edit(embed=new_embed)
                     logger.info(f"Successfully edited translated message {translated_message_id} in channel '{target_channel.name}' for language {lang_code}.")
@@ -737,48 +765,109 @@ class TranslationBot(discord.Client):
             logger.warning("translate_with_fallback called with empty text or target_langs.")
             return {} # Return empty dict for consistency
 
-        # 1. Try Primary Service
-        if 'primary' in self.translation_clients:
-            logger.info(f"Attempting translation with primary service (ID: primary)...")
-            result = await self._translate_with_service('primary', text, source_lang, target_langs)
-            if result is not None: # Check for None explicitly, as {} is a valid (empty) result
-                logger.info("Primary translation service succeeded.")
-                return result
-            else:
-                logger.warning("Primary translation service failed.")
-        else:
-            logger.error("Primary translation service client not initialized. Cannot attempt primary translation.")
+        # --- Language Separation Logic ---
+        effective_length = self.calculate_effective_length(text)
+        threshold = self.settings.get('language_separation_threshold', 800) # Get threshold from settings
+        logger.debug(f"Effective length: {effective_length}, Threshold: {threshold}")
 
-        # 2. Try Remote Fallback Services (if enabled)
-        if self.enable_remote_fallback and 'remote_fallbacks' in self.translation_services:
-            num_fallbacks = len(self.translation_services['remote_fallbacks'])
-            logger.info(f"Attempting translation with {num_fallbacks} remote fallback service(s)...")
-            for i in range(num_fallbacks):
-                service_id = f"fallback_{i}"
-                if service_id in self.translation_clients:
-                    provider = self.translation_clients[service_id].get('provider', 'unknown')
-                    logger.info(f"Attempting translation with remote fallback service {i+1}/{num_fallbacks} (ID: {service_id}, Provider: {provider})...")
-                    result = await self._translate_with_service(service_id, text, source_lang, target_langs)
-                    if result is not None:
-                        logger.info(f"Remote fallback service {service_id} ({provider}) succeeded.")
-                        return result
+        if effective_length > threshold:
+            logger.info(f"Text effective length ({effective_length}) exceeds threshold ({threshold}). Processing languages separately.")
+            combined_translations = {}
+            successful_langs = []
+            failed_langs = []
+
+            for lang in target_langs:
+                logger.info(f"Separated processing: Translating to '{lang}'...")
+                single_lang_target = [lang]
+                single_translation = None
+
+                # Try primary service for this single language
+                if 'primary' in self.translation_clients:
+                    single_translation = await self._translate_with_service('primary', text, source_lang, single_lang_target)
+                    if single_translation is None: logger.warning(f"Separated processing: Primary service failed for '{lang}'.")
+
+                # Try remote fallbacks if primary failed
+                if single_translation is None and self.enable_remote_fallback and 'remote_fallbacks' in self.translation_services:
+                    num_fallbacks = len(self.translation_services['remote_fallbacks'])
+                    for i in range(num_fallbacks):
+                        service_id = f"fallback_{i}"
+                        if service_id in self.translation_clients:
+                            provider = self.translation_clients[service_id].get('provider', 'unknown')
+                            logger.info(f"Separated processing: Trying remote fallback {i+1}/{num_fallbacks} ({provider}) for '{lang}'...")
+                            single_translation = await self._translate_with_service(service_id, text, source_lang, single_lang_target)
+                            if single_translation is not None:
+                                logger.info(f"Separated processing: Remote fallback {service_id} ({provider}) succeeded for '{lang}'.")
+                                break # Stop trying fallbacks for this language if one succeeds
+                            else:
+                                logger.warning(f"Separated processing: Remote fallback {service_id} ({provider}) failed for '{lang}'.")
+
+                # Try Ollama if remote fallbacks failed (or weren't enabled/configured)
+                if single_translation is None and self.enable_ollama_fallback:
+                    logger.info(f"Separated processing: Trying Ollama fallback for '{lang}'...")
+                    single_translation = await self.translate_text_with_ollama(text, source_lang, single_lang_target)
+                    if single_translation is not None:
+                        logger.info(f"Separated processing: Ollama fallback succeeded for '{lang}'.")
                     else:
-                        logger.warning(f"Remote fallback service {service_id} ({provider}) failed.")
+                        logger.warning(f"Separated processing: Ollama fallback failed for '{lang}'.")
+
+                # Combine results
+                if single_translation is not None and lang in single_translation:
+                    combined_translations[lang] = single_translation[lang]
+                    successful_langs.append(lang)
                 else:
-                    logger.warning(f"Remote fallback service {service_id} was configured but not initialized. Skipping.")
+                    logger.error(f"Separated processing: All attempts failed for language '{lang}'.")
+                    failed_langs.append(lang)
+                    combined_translations[lang] = f"[{lang.upper()} translation failed]" # Add placeholder for failed ones
 
-        # 3. Try Ollama Local Fallback (if enabled)
-        if self.enable_ollama_fallback:
-            logger.info("Attempting translation with Ollama local fallback...")
-            result = await self.translate_text_with_ollama(text, source_lang, target_langs)
-            if result is not None:
-                logger.info("Ollama local fallback succeeded.")
-                return result
-            else:
-                logger.warning("Ollama local fallback failed.")
+            logger.info(f"Finished separated language processing. Success: {successful_langs}, Failed: {failed_langs}")
+            return combined_translations # Return combined results, including placeholders for failures
 
-        # All services failed
-        logger.error("All configured translation services (primary, remote fallbacks, Ollama) failed.")
+        # --- Original Logic (if below threshold) ---
+        else:
+            logger.info(f"Text effective length ({effective_length}) is within threshold ({threshold}). Processing all languages together.")
+            # 1. Try Primary Service
+            if 'primary' in self.translation_clients:
+                logger.info(f"Attempting translation with primary service (ID: primary)...")
+                result = await self._translate_with_service('primary', text, source_lang, target_langs) # Correctly indented now
+                if result is not None: # Check for None explicitly, as {} is a valid (empty) result
+                    logger.info("Primary translation service succeeded.")
+                    return result # Return immediately if primary succeeds
+                else:
+                    logger.warning("Primary translation service failed.")
+            else: # Correctly indented else corresponding to 'if primary in ...'
+                logger.error("Primary translation service client not initialized. Cannot attempt primary translation.")
+                # Do not return here, proceed to fallbacks
+
+            # 2. Try Remote Fallback Services (if enabled and primary failed or wasn't available)
+            if self.enable_remote_fallback and 'remote_fallbacks' in self.translation_services:
+                num_fallbacks = len(self.translation_services['remote_fallbacks']) # Correctly indented
+                logger.info(f"Attempting translation with {num_fallbacks} remote fallback service(s)...") # Correctly indented
+                for i in range(num_fallbacks): # Correctly indented
+                    service_id = f"fallback_{i}" # Correctly indented
+                    if service_id in self.translation_clients: # Correctly indented
+                        provider = self.translation_clients[service_id].get('provider', 'unknown') # Correctly indented
+                        logger.info(f"Attempting translation with remote fallback service {i+1}/{num_fallbacks} (ID: {service_id}, Provider: {provider})...") # Correctly indented
+                        result = await self._translate_with_service(service_id, text, source_lang, target_langs) # Correctly indented
+                        if result is not None: # Correctly indented
+                            logger.info(f"Remote fallback service {service_id} ({provider}) succeeded.") # Correctly indented
+                            return result # Correctly indented
+                        else: # Correctly indented
+                            logger.warning(f"Remote fallback service {service_id} ({provider}) failed.") # Correctly indented
+                    else: # Correctly indented
+                        logger.warning(f"Remote fallback service {service_id} was configured but not initialized. Skipping.") # Correctly indented
+
+            # 3. Try Ollama Local Fallback (if enabled and previous steps failed)
+            if self.enable_ollama_fallback:
+                logger.info("Attempting translation with Ollama local fallback...") # Correctly indented
+                result = await self.translate_text_with_ollama(text, source_lang, target_langs) # Correctly indented
+                if result is not None: # Correctly indented
+                    logger.info("Ollama local fallback succeeded.") # Correctly indented
+                    return result # Correctly indented
+                else: # Correctly indented
+                    logger.warning("Ollama local fallback failed.") # Correctly indented
+
+            # All services failed if we reach here
+            logger.error("All configured translation services (primary, remote fallbacks, Ollama) failed.")
         return None # Indicate total failure
 
     async def _translate_with_service(self, service_id: str, text: str, source_lang: str, target_langs: list[str]) -> dict | None:
@@ -798,10 +887,20 @@ class TranslationBot(discord.Client):
 
         logger.debug(f"Using service '{service_id}' ({provider}) with model '{model}'")
 
-        # Construct the prompt (same as original translate_text_with_openai)
+        # --- Dynamically construct the example format for the prompt ---
+        example_pairs = []
+        if len(target_langs) >= 1:
+            example_pairs.append(f'"{target_langs[0]}": "translation for {target_langs[0]}"')
+        if len(target_langs) >= 2:
+            example_pairs.append(f'"{target_langs[1]}": "translation for {target_langs[1]}"')
+        # Add more examples if desired, or handle the case of 0 target_langs if necessary
+        example_format_str = f"{{ {', '.join(example_pairs)} }}" if example_pairs else "{}"
+        # --- End dynamic example construction ---
+
+        # Construct the prompt using the dynamic example
         system_prompt = f"""You are an expert multilingual translator. Translate the user's text from {source_lang} into the following languages: {', '.join(target_langs)}.
 Respond ONLY with a valid JSON object containing the translations. The JSON object should have language codes (exactly as provided: {', '.join(target_langs)}) as keys and the corresponding translated text as string values.
-Example format for targets {target_langs}: {{ "{target_langs[0]}": "translation for {target_langs[0]}", "{target_langs[1]}": "translation for {target_langs[1]}" }}
+Example format for targets {target_langs}: {example_format_str}
 Ensure the output is nothing but the JSON object. Do not include any explanations, markdown formatting around the JSON, or introductory text. Preserve original formatting like markdown (e.g., bold, italics) within the translated strings where appropriate, but prioritize accurate translation. If the input text is empty or contains only whitespace, return an empty JSON object {{}}.
 Target languages: {target_langs}"""
         user_prompt = text if text else ""
@@ -813,7 +912,7 @@ Target languages: {target_langs}"""
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.5,
-                max_tokens=1500 # Consider making this configurable per service later if needed
+                max_tokens=6000 # Consider making this configurable per service later if needed
             )
             content_str = response.choices[0].message.content
             if not content_str:
@@ -831,10 +930,42 @@ Target languages: {target_langs}"""
                 logger.debug(f"Original content_str from {service_id}: {content_str}")
                 return None
 
-            # Parse JSON
-            translations = json.loads(cleaned_content_str)
+            # Parse JSON with fallback for truncation
+            translations = None
+            try:
+                translations = json.loads(cleaned_content_str)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Initial JSON parsing failed for service '{service_id}' ({provider}): {e}. Possible truncation. Attempting recovery.")
+                logger.debug(f"Raw content before recovery attempt: {cleaned_content_str}")
+                # Attempt to find the last valid JSON object part
+                last_brace_index = cleaned_content_str.rfind('}')
+                if last_brace_index != -1:
+                    truncated_json_str = cleaned_content_str[:last_brace_index + 1]
+                    # Add heuristics: Check if it looks somewhat like a JSON object ending
+                    if '"' in truncated_json_str and ':' in truncated_json_str:
+                        logger.info(f"Attempting to parse potentially truncated JSON: {truncated_json_str}")
+                        try:
+                            translations = json.loads(truncated_json_str)
+                            logger.info(f"Successfully parsed truncated JSON from service '{service_id}' ({provider}).")
+                        except json.JSONDecodeError as e_recovery:
+                            logger.error(f"Failed to parse even the truncated JSON from service '{service_id}' ({provider}): {e_recovery}")
+                            logger.debug(f"Truncated string attempted: {truncated_json_str}")
+                            # Optional: Add regex fallback here if needed as a last resort
+                            # json_match = re.search(r'\{.*\}', cleaned_content_str, re.DOTALL) ... etc.
+                    else:
+                         logger.error(f"Truncated string for service '{service_id}' ({provider}) does not appear to be a valid JSON fragment ending.")
+                         logger.debug(f"Truncated string attempted: {truncated_json_str}")
+
+                else:
+                    logger.error(f"Could not find a closing brace '}}' in the response from service '{service_id}' ({provider}) to attempt recovery.")
+
+                if translations is None: # If recovery failed
+                     return None # Give up for this service
+
+            # --- End JSON Parsing Fallback ---
+
             if not isinstance(translations, dict):
-                logger.error(f"Parsed content from service '{service_id}' ({provider}) is not a valid JSON object: {translations}")
+                logger.error(f"Parsed content from service '{service_id}' ({provider}) is not a valid JSON object (even after potential recovery): {translations}")
                 return None
 
             # Validate and filter response (ensure all target langs are present, filter extras)
@@ -857,14 +988,14 @@ Target languages: {target_langs}"""
 
             return final_translations # Return the validated/filtered dictionary
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON response from service '{service_id}' ({provider}): {e}")
-            original_content_to_log = content_str if content_str is not None else "[Could not get raw response content]"
-            logger.error(f"Raw response content from {service_id}: {original_content_to_log}")
-            return None
-        except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
+        # except json.JSONDecodeError as e: # This is now handled by the try/except block above
+        #     logger.error(f"Failed to parse JSON response from service '{service_id}' ({provider}): {e}")
+        #     original_content_to_log = content_str if content_str is not None else "[Could not get raw response content]"
+        #     logger.error(f"Raw response content from {service_id}: {original_content_to_log}")
+        #     return None
+        except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError, openai.APITimeoutError, openai.BadRequestError) as e: # Added Timeout/BadRequest
              # Catch specific OpenAI errors (or compatible errors)
-             logger.error(f"API error with service '{service_id}' ({provider}): {type(e).__name__} - {e}")
+             logger.error(f"API error with service '{service_id}' ({provider}): {type(e).__name__} - Status: {getattr(e, 'status_code', 'N/A')} - {e}")
              return None
         except (AttributeError, IndexError, TypeError) as e:
              logger.error(f"Error processing API response structure from service '{service_id}' ({provider}): {e}")
