@@ -10,7 +10,7 @@ from openai import AsyncOpenAI
 import re
 from collections import defaultdict
 import aiosqlite
-import aiohttp # Added for Ollama
+import aiohttp
 
 # --- Configuration ---
 CONFIG_FILE = 'config.yaml'
@@ -51,7 +51,7 @@ class TranslationBot(discord.Client):
         self.translation_clients = {}   # Stores initialized API clients (AsyncOpenAI instances)
         self.enable_remote_fallback = False
         self.enable_ollama_fallback = False
-        self.ollama_config = {}
+        # ollama_config不再需要，現在Ollama也通過統一服務系統管理
         self.db: aiosqlite.Connection | None = None
 
     async def setup_hook(self) -> None:
@@ -88,9 +88,18 @@ class TranslationBot(discord.Client):
         else:
              logger.info("Remote fallback services are disabled.")
 
-        # Note: Ollama doesn't need an AsyncOpenAI client, its config is used directly in its method.
+        # Ollama現在作為remote_fallbacks的一部分，上面已經初始化過
         if self.enable_ollama_fallback:
-            logger.info(f"Ollama fallback enabled (Model: {self.ollama_config.get('model', 'N/A')}). Client is created on demand.")
+            ollama_found = False
+            if 'remote_fallbacks' in self.translation_services:
+                for config in self.translation_services['remote_fallbacks']:
+                    if config.get('provider') == 'ollama':
+                        ollama_found = True
+                        model = config.get('model', 'N/A')
+                        logger.info(f"Ollama fallback enabled (Model: {model}). Already initialized as part of remote fallbacks.")
+                        break
+            if not ollama_found:
+                logger.warning("Ollama fallback is enabled but no Ollama provider found in remote_fallbacks.")
         else:
             logger.info("Ollama fallback is disabled.")
 
@@ -202,6 +211,9 @@ class TranslationBot(discord.Client):
                     self.settings['max_retries'] = int(config_data['settings'].get('max_retries', self.settings['max_retries']))
                     self.settings['retry_delay'] = int(config_data['settings'].get('retry_delay', self.settings['retry_delay']))
                     self.settings['language_separation_threshold'] = int(config_data['settings'].get('language_separation_threshold', self.settings['language_separation_threshold']))
+                    # 加載全局翼譯設定
+                    self.settings['translation_tone'] = config_data['settings'].get('translation_tone', '')
+                    self.settings['special_instructions'] = config_data['settings'].get('special_instructions', '')
                     logger.info(f"Successfully loaded general settings (Threshold: {self.settings['language_separation_threshold']}).")
                 else: logger.info(f"No 'settings' section found, using default settings (Threshold: {self.settings['language_separation_threshold']}).")
 
@@ -229,15 +241,19 @@ class TranslationBot(discord.Client):
                     else:
                         logger.info("Remote fallback is disabled.")
 
-                    # Load Ollama fallback settings
+                    # Ollama現在也作為remote_fallbacks的一部分，檢查是否在fallbacks中
                     self.enable_ollama_fallback = ts_config.get('enable_ollama_fallback', False)
                     if self.enable_ollama_fallback:
-                        if 'ollama' in ts_config and isinstance(ts_config['ollama'], dict):
-                            self.ollama_config = ts_config['ollama']
-                            logger.info(f"Ollama local fallback enabled. Loaded configuration for model: {self.ollama_config.get('model', 'N/A')}")
-                        else:
-                            logger.warning("Ollama fallback is enabled but 'ollama' configuration is missing or invalid. Disabling Ollama fallback.")
-                            self.enable_ollama_fallback = False
+                        # 檢查remote_fallbacks中是否有Ollama provider
+                        ollama_found = False
+                        if 'remote_fallbacks' in ts_config and isinstance(ts_config['remote_fallbacks'], list):
+                            for config in ts_config['remote_fallbacks']:
+                                if config.get('provider') == 'ollama':
+                                    ollama_found = True
+                                    logger.info(f"Ollama local fallback enabled as part of remote fallbacks. Model: {config.get('model', 'N/A')}")
+                                    break
+                        if not ollama_found:
+                            logger.warning("Ollama fallback is enabled but no Ollama provider found in remote_fallbacks. It won't be available.")
                     else:
                         logger.info("Ollama local fallback is disabled.")
                 else:
@@ -282,11 +298,18 @@ class TranslationBot(discord.Client):
                 'enable_remote_fallback': False,
                 'remote_fallbacks': [
                     {
-                        'provider': 'openai',
-                        'base_url': 'https://api.openai.com/v1',
-                        'model': 'gpt-4o',
-                        'api_key': 'YOUR_OPENAI_API_KEY'
+                        'provider': 'openrouter',
+                        'base_url': 'https://openrouter.ai/api/v1',
+                        'model': 'google/gemma-3-12b-it:free',
+                        'api_key': 'YOUR_OPENROUTER_API_KEY'
                     },
+                    {
+                        'provider': 'ollama',
+                        'base_url': 'http://localhost:11434',
+                        'model': 'llama3',
+                        'api_key': None,  # Ollama doesn't need API key
+                        'timeout': 90
+                    }
                     # Add more fallback services here if needed
                     # {
                     #     'provider': 'azure',
@@ -297,17 +320,14 @@ class TranslationBot(discord.Client):
                     #     'deployment_name': 'your-deployment'
                     # }
                 ],
-                'enable_ollama_fallback': False,
-                'ollama': {
-                    'base_url': 'http://localhost:11434', # Corrected: Base URL only, path is added in code
-                    'model': 'llama3', # Example model, change if needed
-                    'timeout': 30 # Request timeout in seconds
-                }
+                'enable_ollama_fallback': False  # 現在Ollama通過remote_fallbacks管理
             },
             'settings': {
-                # 'translation_model' is now defined per service in 'translation_services'
+                'translation_tone': '', # casual, formal, professional, friendly
+                'special_instructions': '', # Additional translation instructions
                 'max_retries': 2, # General retry setting (can be overridden per service if needed later)
-                'retry_delay': 3 # General retry delay
+                'retry_delay': 3, # General retry delay
+                'language_separation_threshold': 1200 # Character count threshold
             }
         }
         try:
@@ -731,6 +751,17 @@ class TranslationBot(discord.Client):
             provider = config.get('provider', 'unknown')
             base_url = config.get('base_url')
             api_key = config.get('api_key')
+            
+            # Ollama不需要實際初始化OpenAI client，只需要儲存config
+            if provider == 'ollama':
+                self.translation_clients[service_id] = {
+                    'client': None,  # Ollama不使用OpenAI client
+                    'provider': provider,
+                    'model': config.get('model'),
+                    'config': config
+                }
+                logger.info(f"Initialized Ollama configuration for service ID: {service_id} (Model: {config.get('model')})")
+                return True
 
             if not base_url or not api_key:
                 logger.error(f"Missing base_url or api_key for {provider} service ({service_id}). Cannot initialize.")
@@ -803,12 +834,26 @@ class TranslationBot(discord.Client):
 
                 # Try Ollama if remote fallbacks failed (or weren't enabled/configured)
                 if single_translation is None and self.enable_ollama_fallback:
-                    logger.info(f"Separated processing: Trying Ollama fallback for '{lang}'...")
-                    single_translation = await self.translate_text_with_ollama(text, source_lang, single_lang_target)
-                    if single_translation is not None:
-                        logger.info(f"Separated processing: Ollama fallback succeeded for '{lang}'.")
+                    # Ollama現在也可以通過統一服務系統來處理
+                    # 先查找Ollama service
+                    ollama_service_id = None
+                    if 'remote_fallbacks' in self.translation_services:
+                        for idx, config in enumerate(self.translation_services['remote_fallbacks']):
+                            if config.get('provider') == 'ollama':
+                                ollama_service_id = f"fallback_{idx}"
+                                break
+                    
+                    if ollama_service_id and ollama_service_id in self.translation_clients:
+                        logger.info(f"Separated processing: Trying Ollama fallback for '{lang}'...")
+                        single_translation = await self._translate_with_service(ollama_service_id, text, source_lang, single_lang_target)
+                        if single_translation is not None:
+                            logger.info(f"Separated processing: Ollama fallback succeeded for '{lang}'.")
+                        else:
+                            logger.warning(f"Separated processing: Ollama fallback failed for '{lang}'.")
                     else:
-                        logger.warning(f"Separated processing: Ollama fallback failed for '{lang}'.")
+                        logger.warning(f"Ollama fallback is enabled but no Ollama service found in fallbacks for '{lang}'.")
+                        # 備用：如果不想修改config，也可以繼續使用舊方法
+                        # single_translation = await self.translate_text_with_ollama(text, source_lang, single_lang_target)
 
                 # Combine results
                 if single_translation is not None and lang in single_translation:
@@ -858,13 +903,27 @@ class TranslationBot(discord.Client):
 
             # 3. Try Ollama Local Fallback (if enabled and previous steps failed)
             if self.enable_ollama_fallback:
-                logger.info("Attempting translation with Ollama local fallback...") # Correctly indented
-                result = await self.translate_text_with_ollama(text, source_lang, target_langs) # Correctly indented
-                if result is not None: # Correctly indented
-                    logger.info("Ollama local fallback succeeded.") # Correctly indented
-                    return result # Correctly indented
-                else: # Correctly indented
-                    logger.warning("Ollama local fallback failed.") # Correctly indented
+                # Ollama現在也可以通過統一服務系統來處理
+                # 先查找Ollama service
+                ollama_service_id = None
+                if 'remote_fallbacks' in self.translation_services:
+                    for idx, config in enumerate(self.translation_services['remote_fallbacks']):
+                        if config.get('provider') == 'ollama':
+                            ollama_service_id = f"fallback_{idx}"
+                            break
+                
+                if ollama_service_id and ollama_service_id in self.translation_clients:
+                    logger.info("Attempting translation with Ollama local fallback...") # Correctly indented
+                    result = await self._translate_with_service(ollama_service_id, text, source_lang, target_langs) # Correctly indented
+                    if result is not None: # Correctly indented
+                        logger.info("Ollama local fallback succeeded.") # Correctly indented
+                        return result # Correctly indented
+                    else: # Correctly indented
+                        logger.warning("Ollama local fallback failed.") # Correctly indented
+                else:
+                    logger.warning("Ollama fallback is enabled but no Ollama service found in fallbacks.")
+                    # 備用：如果不想修改config，也可以繼續使用舊方法
+                    # result = await self.translate_text_with_ollama(text, source_lang, target_langs)
 
             # All services failed if we reach here
             logger.error("All configured translation services (primary, remote fallbacks, Ollama) failed.")
@@ -880,6 +939,10 @@ class TranslationBot(discord.Client):
         client = service_info['client']
         model = service_info['model']
         provider = service_info['provider']
+        
+        # Ollama特殊處理
+        if provider == 'ollama':
+            return await self._translate_with_ollama_logic(service_info, text, source_lang, target_langs)
 
         if not client or not model:
             logger.error(f"Client or model missing for service '{service_id}' ({provider}).")
@@ -903,6 +966,13 @@ Respond ONLY with a valid JSON object containing the translations. The JSON obje
 Example format for targets {target_langs}: {example_format_str}
 Ensure the output is nothing but the JSON object. Do not include any explanations, markdown formatting around the JSON, or introductory text. Preserve original formatting like markdown (e.g., bold, italics) within the translated strings where appropriate, but prioritize accurate translation. If the input text is empty or contains only whitespace, return an empty JSON object {{}}.
 Target languages: {target_langs}"""
+        
+        # 全局設定應用
+        if self.settings.get('translation_tone'):
+            system_prompt += f"\n\nTone requirement: {self.settings['translation_tone']}"
+        
+        if self.settings.get('special_instructions'):
+            system_prompt += f"\n\nAdditional instructions: {self.settings['special_instructions']}"
         user_prompt = text if text else ""
         content_str = None
 
@@ -912,7 +982,7 @@ Target languages: {target_langs}"""
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.5,
-                max_tokens=6000 # Consider making this configurable per service later if needed
+                max_tokens=4000 # Consider making this configurable per service later if needed
             )
             content_str = response.choices[0].message.content
             if not content_str:
@@ -1007,6 +1077,127 @@ Target languages: {target_langs}"""
             logger.error(f"Unexpected error during translation with service '{service_id}' ({provider}): {e}", exc_info=True)
             return None
 
+    async def _translate_with_ollama_logic(self, service_info: dict, text: str, source_lang: str, target_langs: list[str]) -> dict | None:
+        """Ollama專用的翼譯逻輯"""
+        config = service_info['config']
+        base_url = config.get('base_url')
+        model = config.get('model')
+        timeout_seconds = config.get('timeout', 30)
+        
+        if not base_url or not model:
+            logger.error(f"Ollama base_url or model is not configured for service '{service_info.get('provider')}'.")
+            return None
+            
+        # Construct the prompt for Ollama (similar structure, might need tuning per model)
+        system_prompt = f"""You are an expert multilingual translator. Translate the text from {source_lang} into the following languages: {', '.join(target_langs)}.
+Respond ONLY with a valid JSON object containing the translations. Format: {{"lang_code": "translation"}}
+Example for targets {target_langs}: {{ "{target_langs[0]}": "translation for {target_langs[0]}", "{target_langs[1]}": "translation for {target_langs[1]}" }}
+Ensure the output is nothing but the JSON object. Do not include explanations or introductory text."""
+        
+        # 全局設定應用
+        if self.settings.get('translation_tone'):
+            system_prompt += f"\n\nTone: {self.settings['translation_tone']}"
+        
+        if self.settings.get('special_instructions'):
+            system_prompt += f"\n\nAdditional instructions: {self.settings['special_instructions']}"
+
+        full_prompt = f"{system_prompt}\n\nText to translate:\n{text}"
+        api_endpoint = f"{base_url.rstrip('/')}/api/generate" # Use /api/generate for non-streaming
+
+        logger.debug(f"Sending request to Ollama: Endpoint={api_endpoint}, Model={model}")
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
+                async with session.post(
+                    api_endpoint,
+                    json={"model": model, "prompt": full_prompt, "stream": False, "format": "json"}, # Request JSON format directly if model supports it
+                ) as response:
+                    response_text = await response.text() # Get text first for logging
+                    if response.status != 200:
+                        logger.error(f"Ollama API error: Status {response.status}, Response: {response_text}")
+                        return None
+
+                    # Attempt to parse the JSON response
+                    try:
+                        result = json.loads(response_text)
+                        # Ollama's non-streaming JSON response is typically in result['response'] as a stringified JSON
+                        response_content_str = result.get('response')
+                        if not response_content_str:
+                             logger.error("Ollama response key 'response' is missing or empty.")
+                             logger.debug(f"Full Ollama JSON result: {result}")
+                             return None
+
+                        # Parse the inner JSON string
+                        translations = json.loads(response_content_str)
+                        if not isinstance(translations, dict):
+                            logger.error(f"Parsed inner content from Ollama is not a dict: {translations}")
+                            return None
+
+                        # Validate and filter response (similar to _translate_with_service)
+                        final_translations = {}
+                        missing_langs = []
+                        for lang in target_langs:
+                            if lang in translations and isinstance(translations[lang], str):
+                                final_translations[lang] = translations[lang]
+                            else:
+                                missing_langs.append(lang)
+                                final_translations[lang] = f"[{lang.upper()} translation missing or invalid]"
+
+                        if missing_langs:
+                            logger.warning(f"Ollama response missing or invalid translations for: {missing_langs}")
+
+                        return final_translations
+
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse JSON from Ollama response: {e}")
+                        # Try regex as a fallback if direct JSON parsing fails (e.g., model didn't respect format="json")
+                        logger.info("Attempting regex fallback for Ollama JSON extraction...")
+                        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                        if json_match:
+                            json_str = json_match.group(0)
+                            try:
+                                translations = json.loads(json_str)
+                                if isinstance(translations, dict):
+                                     # Validate and filter again
+                                    final_translations = {}
+                                    missing_langs = []
+                                    for lang in target_langs:
+                                        if lang in translations and isinstance(translations[lang], str):
+                                            final_translations[lang] = translations[lang]
+                                        else:
+                                            missing_langs.append(lang)
+                                            final_translations[lang] = f"[{lang.upper()} translation missing or invalid]"
+                                    if missing_langs: logger.warning(f"Ollama (regex fallback) missing/invalid translations for: {missing_langs}")
+                                    logger.info("Ollama regex fallback JSON extraction successful.")
+                                    return final_translations
+                                else:
+                                     logger.error("Ollama regex fallback extracted content is not a dict.")
+                            except json.JSONDecodeError as e_regex:
+                                logger.error(f"Failed to parse JSON even from regex fallback: {e_regex}")
+                                logger.debug(f"Ollama raw response (regex failed): {response_text}")
+                                return None
+                        else:
+                            logger.error("Could not find any JSON object in Ollama response via regex.")
+                            logger.debug(f"Ollama raw response (regex failed): {response_text}")
+                            return None
+                    except Exception as e_inner:
+                         logger.error(f"Error processing Ollama response content: {e_inner}")
+                         logger.debug(f"Ollama raw response: {response_text}")
+                         return None
+
+        except aiohttp.ClientConnectorError as e:
+            logger.error(f"Ollama connection error: Could not connect to {api_endpoint}. Is Ollama running? Error: {e}")
+            return None
+        except asyncio.TimeoutError:
+             logger.error(f"Ollama request timed out after {timeout_seconds} seconds.")
+             return None
+        except aiohttp.ClientError as e:
+            logger.error(f"Ollama client error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error during Ollama translation: {e}", exc_info=True)
+            return None
+        
     async def translate_text_with_ollama(self, text: str, source_lang: str, target_langs: list[str]) -> dict | None:
         """Translates text using a local Ollama model via its API."""
         if not self.ollama_config:
@@ -1026,6 +1217,13 @@ Target languages: {target_langs}"""
 Respond ONLY with a valid JSON object containing the translations. Format: {{"lang_code": "translation"}}
 Example for targets {target_langs}: {{ "{target_langs[0]}": "translation for {target_langs[0]}", "{target_langs[1]}": "translation for {target_langs[1]}" }}
 Ensure the output is nothing but the JSON object. Do not include explanations or introductory text."""
+        
+        # 全局設定應用
+        if self.settings.get('translation_tone'):
+            system_prompt += f"\n\nTone: {self.settings['translation_tone']}"
+        
+        if self.settings.get('special_instructions'):
+            system_prompt += f"\n\nAdditional instructions: {self.settings['special_instructions']}"
 
         full_prompt = f"{system_prompt}\n\nText to translate:\n{text}"
         api_endpoint = f"{base_url.rstrip('/')}/api/generate" # Use /api/generate for non-streaming
