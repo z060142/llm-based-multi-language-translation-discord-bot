@@ -70,33 +70,59 @@ After installation, you have the following options:
 ### Using the UI
 
 The graphical interface provides complete control:
-- Configure Discord token and API keys
+
+#### Configure Discord token and API keys
 First get your [Discord token](https://docs.unified.to/guides/how_to_get_your_discord_oauth_2_credentials_and_bot_token "Tutorial")
+
 ![Enter Discord token](reference/1.png "Enter Discord token")
-- Set up translation services (primary and fallbacks)
+
+#### Set up translation services (primary and fallbacks)
 The setup for primary service and fallback services is similar
+
 ![Add service](reference/2.png "Add service")
+
 You can also use local LLM translation through Ollama, set the URL to `http://localhost:11434`
+
 ![Using Ollama service](reference/3.png "Using Ollama service")
+
 Enable remote or local fallback services
+
 ![Enable remote or local fallback services](reference/4.png "Enable remote or local fallback services")
-- Add/edit/delete channels with different types
+
+#### Add/edit/delete channels with different types
 Use language tags based on [ISO 693-3](https://en.wikipedia.org/wiki/ISO_639-3 "Wikipedia") to set translation languages
-You can choose channel types: Standard (can read and receive translations), read_only (only reads messages, doesn't receive translations), write_only (only receives translations, doesn't read messages)
+
+You can choose channel types:
+- Standard (can read and receive translations)
+- read_only (only reads messages, doesn't receive translations)
+- write_only (only receives translations, doesn't read messages)
+
 Please copy channel IDs from Discord yourself
+
 ![Add Channel](reference/5.png "Add Channel")
-- Configure translation settings (tone, special instructions)
+
+#### Configure translation settings (tone, special instructions)
 You can additionally set translation tone, special instructions, and character threshold for when to process different languages separately
+
 ![Additional settings](reference/6.png "Additional settings")
-- Save settings and activate the bot
+
+#### Save settings and activate the bot
+
 ![Bot control](reference/7.png "Bot control")
-- Monitor bot status and logs
+
+#### Monitor bot status and logs
 Send a message to test
+
 ![General message](reference/8.png "General message")
+
 Translations will be sent to the configured channels at once
+
 ![Message notification](reference/9.png "Message notification")
+
 All channels will synchronize content in their configured languages
+
 ![English channel](reference/10.png "English channel")
+
 ![German channel](reference/11.png "German channel")
 
 ### Manual Configuration Example
